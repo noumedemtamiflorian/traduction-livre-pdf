@@ -1,0 +1,20 @@
+# Python cache
+__pycache__/
+*.py[cod]
+*$py.class
+.venv/
+venv/
+env/
+
+# OS & Editor files
+.DS_Store
+Thumbs.db
+.vscode/
+.idea/
+
+# Temporary test outputs
+*.pdf
+*.merge_report.json
+*.pdf_report.json
+extraction_manifest.json
+book_text.txt
