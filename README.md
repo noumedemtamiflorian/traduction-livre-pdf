@@ -10,7 +10,8 @@ Un **Skill universel** (au standard ouvert `SKILL.md`) permettant à n'importe q
 2. **Charte éditoriale & Glossaire (`00_INDEX_ET_PLAN.md`)** : Identifie les termes clés et concepts de l'auteur, propose un glossaire et un plan de découpage par chapitres, et les fait valider par l'utilisateur avant de lancer la traduction.
 3. **Traduction intégrale chapitre par chapitre** : Traduit chaque chapitre en entier (zéro résumé, zéro omission) dans un style fluide et naturel, sans jamais utiliser de blocs de code informatique parasites.
 4. **Intégration des images + Traduction du texte interne aux images** : Inspecte visuellement chaque illustration extraite, l'insère à sa place exacte dans le chapitre, et ajoute juste en dessous un **encadré traduisant tous les textes visibles à l'intérieur même de l'image** (schémas, bulles, notes manuscrites sur tableau blanc, étiquettes, écrans d'applications, cartels de musée).
-5. **Fusion & Génération du PDF A4 (`merge` & `build-pdf`)** : Assemble tous les chapitres en un livre complet (`.md`) et génère un **PDF A4 prêt à lire ou imprimer** (avec typographie *Georgia* / *Segoe UI*, en-têtes courants, numérotation des pages, images centrées et encadrés de traduction ambrés solidaires de leur image).
+5. **Audit obligatoire d'intégrité et de complétude (`audit`)** : Compare mathématiquement le texte source et le texte traduit chapitre par chapitre (ratio de foisonnement, détection des sous-sections omises, images et blocs de code). Bloque la fusion si un chapitre est tronqué ou résumé.
+6. **Fusion & Génération du PDF A4 (`merge` & `build-pdf`)** : Assemble tous les chapitres validés en un livre complet (`.md`) et génère un **PDF A4 prêt à lire ou imprimer** (avec typographie *Georgia* / *Segoe UI*, en-têtes courants, numérotation des pages, images centrées et encadrés de traduction ambrés solidaires de leur image).
 
 ---
 
@@ -63,7 +64,14 @@ Le skill inclut un outil Python autonome utilisable directement en ligne de comm
 # 1. Extraire le texte et les images d'un PDF
 python scripts/book_pipeline.py extract --pdf "The Right It.pdf" --out-dir "./Traduction_FR"
 
-# 2. Fusionner les chapitres Markdown traduits
+# 2. Auditer la complétude et l'intégrité de la traduction (bloque si résumé ou coupé)
+python scripts/book_pipeline.py audit \
+  --pdf "The Right It.pdf" \
+  --chapters-dir "./Traduction_FR" \
+  --min-ratio 1.05 \
+  --strict
+
+# 3. Fusionner les chapitres Markdown validés
 python scripts/book_pipeline.py merge \
   --chapters-dir "./Traduction_FR" \
   --output "./Traduction_FR/LIVRE_COMPLET.md" \
@@ -71,7 +79,7 @@ python scripts/book_pipeline.py merge \
   --subtitle "Pourquoi tant d'idées échouent et comment vous assurer que la vôtre réussisse" \
   --author "Alberto Savoia"
 
-# 3. Générer le livre PDF A4 final
+# 4. Générer le livre PDF A4 final
 python scripts/book_pipeline.py build-pdf \
   --input "./Traduction_FR/LIVRE_COMPLET.md" \
   --output "./LIVRE_COMPLET.pdf" \

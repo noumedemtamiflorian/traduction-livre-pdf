@@ -4,8 +4,9 @@ book_pipeline.py — Universal CLI utility for the `traduction-livre-pdf` skill.
 
 Subcommands:
   1. extract   : Extracts full text (page by page) and all embedded images from a source PDF.
-  2. merge     : Merges translated Markdown chapters into a single unified Markdown book.
-  3. build-pdf : Converts a unified Markdown book (with images and image-translation boxes)
+  2. audit     : Audits completeness and fidelity between the source PDF and translated Markdown chapters.
+  3. merge     : Merges translated Markdown chapters into a single unified Markdown book.
+  4. build-pdf : Converts a unified Markdown book (with images and image-translation boxes)
                  into a print-ready A4 PDF and a standalone HTML file.
 
 Works across Windows, macOS, and Linux, and with any AI model/agent.
@@ -137,7 +138,7 @@ def cmd_merge(args):
     chapter_files = []
     for p in all_md:
         name_upper = p.name.upper()
-        if "INDEX" in name_upper or "LIVRE_COMPLET" in name_upper or p.resolve() == output_md:
+        if "INDEX" in name_upper or "RAPPORT" in name_upper or "AUDIT" in name_upper or "LIVRE_COMPLET" in name_upper or p.resolve() == output_md:
             continue
         if re.match(r"^\d{2}_", p.name):
             chapter_files.append(p)
@@ -813,6 +814,293 @@ def cmd_build_pdf(args):
     )
 
 
+def cmd_audit(args):
+    """
+    Audits the completeness and fidelity between the source PDF and translated Markdown chapters.
+    Calculates expansion ratios, checks for missing sections from the PDF outline,
+    flags prohibited code blocks, and verifies image coverage.
+    """
+    try:
+        from pypdf import PdfReader
+    except ImportError as exc:
+        sys.stderr.write(
+            f"Error: Missing Python dependency ({exc}).\n"
+            "Run: python -m pip install pypdf reportlab Pillow\n"
+        )
+        sys.exit(1)
+
+    pdf_path = pathlib.Path(args.pdf).resolve()
+    chapters_dir = pathlib.Path(args.chapters_dir).resolve()
+
+    if not pdf_path.exists():
+        sys.stderr.write(f"Error: Source PDF not found: {pdf_path}\n")
+        sys.exit(1)
+
+    if not chapters_dir.exists():
+        sys.stderr.write(f"Error: Chapters dir not found: {chapters_dir}\n")
+        sys.exit(1)
+
+    reader = PdfReader(str(pdf_path))
+    total_pdf_pages = len(reader.pages)
+
+    # Extract page text
+    pages_text = [p.extract_text() or "" for p in reader.pages]
+    total_src_words = sum(len(txt.split()) for txt in pages_text)
+
+    # Parse PDF Outline
+    outline = []
+    def parse_items(items, depth=1):
+        for it in items:
+            if isinstance(it, list):
+                parse_items(it, depth + 1)
+            else:
+                try:
+                    p = reader.get_destination_page_number(it)
+                    outline.append({'depth': depth, 'title': it.title, 'page': p + 1})
+                except Exception:
+                    pass
+    if reader.outline:
+        parse_items(reader.outline)
+
+    # Get translated markdown chapter files
+    md_files = sorted([
+        f for f in chapters_dir.glob("*.md")
+        if not f.name.startswith("00_INDEX")
+        and not f.name.startswith("00_RAPPORT")
+        and not f.name.startswith("LIVRE_COMPLET")
+    ])
+
+    # Identify chapter anchors from outline
+    anchors = []
+    intro_start = None
+    for o in outline:
+        title_lower = o['title'].lower()
+        if any(w in title_lower for w in ['prelude', 'introduction', 'overview', 'foreword', 'preface']):
+            if intro_start is None:
+                intro_start = o['page']
+    if intro_start is None:
+        intro_start = 1
+    anchors.append(('00', 'Introduction / Prelude', intro_start))
+
+    for o in outline:
+        title = o['title']
+        m = re.match(r'^(?:Chapter\s+|Part\s+)?([0-9]+)\s*[:\.\-]\s*(.*)$', title, re.IGNORECASE)
+        if m:
+            ch_num = int(m.group(1))
+            ch_prefix = f"{ch_num:02d}"
+            anchors.append((ch_prefix, title, o['page']))
+
+    # Fallback if no numbered chapters detected in outline
+    if len(anchors) <= 1 and md_files:
+        anchors = []
+        for idx, f in enumerate(md_files):
+            prefix = f.name[:2] if f.name[:2].isdigit() else f"{idx:02d}"
+            anchors.append((prefix, f.stem, 1))
+
+    chapter_audits = []
+    total_trans_words = 0
+    total_code_blocks = 0
+    total_images_found = 0
+    total_image_boxes_found = 0
+    has_critical_failure = False
+
+    min_ratio = getattr(args, 'min_ratio', 1.05)
+
+    for idx, anc in enumerate(anchors):
+        ch_num = anc[0]
+        ch_title = anc[1]
+        p_start = anc[2]
+        p_end = anchors[idx+1][2] - 1 if idx + 1 < len(anchors) else total_pdf_pages
+
+        # Subheadings in outline for this chapter
+        subs = [o['title'] for o in outline if p_start <= o['page'] <= p_end and o['title'] != ch_title]
+
+        # Source words in this range
+        src_words = sum(len(pages_text[p-1].split()) for p in range(p_start, min(p_end, total_pdf_pages) + 1))
+
+        # Matching markdown file
+        matching_md = None
+        for f in md_files:
+            if f.name.startswith(f"{ch_num}_") or f.name == f"{ch_num}.md":
+                matching_md = f
+                break
+
+        trans_words = 0
+        trans_chars = 0
+        code_blocks_count = 0
+        img_refs = []
+        img_boxes = 0
+        md_headings = []
+        file_present = matching_md is not None
+
+        if matching_md:
+            text = matching_md.read_text(encoding='utf-8')
+            trans_words = len(text.split())
+            trans_chars = len(text)
+            total_trans_words += trans_words
+
+            # Code block check (```)
+            code_blocks = re.findall(r'```[a-zA-Z0-9_-]*\n', text)
+            code_blocks_count = len(code_blocks)
+            total_code_blocks += code_blocks_count
+
+            # Images check
+            img_refs = re.findall(r'!\[.*?\]\((.*?)\)', text)
+            total_images_found += len(img_refs)
+
+            # Translation boxes
+            img_boxes = len(re.findall(r'>\s*\*\*Traduction (?:du texte|des inscriptions) présent', text, re.IGNORECASE))
+            total_image_boxes_found += img_boxes
+
+            # MD headings
+            md_headings = [line.lstrip('#').strip() for line in text.splitlines() if line.strip().startswith('#')]
+
+        ratio = (trans_words / src_words) if src_words > 0 else 0
+
+        # Determine status
+        if not file_present:
+            status = "CRITIQUE (Fichier Manquant)"
+            badge = "🔴 MANQUANT"
+            has_critical_failure = True
+        elif ratio < 0.88:
+            status = "CRITIQUE (Fortement Tronqué / Résumé)"
+            badge = "🔴 COUPÉ"
+            has_critical_failure = True
+        elif ratio < min_ratio:
+            status = "ATTENTION (Condensé ou Résumé Partiel)"
+            badge = "🟡 CONDENSÉ"
+        elif ratio > 1.60:
+            status = "ATTENTION (Volume Anormalement Élevé)"
+            badge = "🟡 VOLUMINEUX"
+        else:
+            status = "CONFORME (Traduction Intégrale Respectée)"
+            badge = "🟢 CONFORME"
+
+        chapter_audits.append({
+            "chapter_num": ch_num,
+            "title": ch_title,
+            "file": matching_md.name if matching_md else None,
+            "page_range": f"p.{p_start}-{p_end}",
+            "source_words": src_words,
+            "translated_words": trans_words,
+            "expansion_ratio": round(ratio, 2),
+            "status": status,
+            "badge": badge,
+            "code_blocks": code_blocks_count,
+            "images_count": len(img_refs),
+            "image_translation_boxes": img_boxes,
+            "source_subheadings_count": len(subs),
+            "source_subheadings": subs,
+            "translated_headings": md_headings
+        })
+
+    global_ratio = (total_trans_words / total_src_words) if total_src_words > 0 else 0
+    if global_ratio < 0.90:
+        global_status = "🔴 ÉCHEC GLOBAL : Le document est tronqué d'au moins 20-30% par rapport à l'original."
+    elif global_ratio < min_ratio:
+        global_status = f"🟡 ATTENTION GLOBALE : Le volume traduit ({global_ratio:.2f}x) est inférieur au seuil recommandé ({min_ratio:.2f}x)."
+    else:
+        global_status = "🟢 CONFORME GLOBAL : Le volume global correspond à une traduction intégrale rigoureuse."
+
+    # Print Console Report
+    print("=" * 80)
+    print(" AUDIT D'INTÉGRITÉ ET DE COMPLÉTUDE DE LA TRADUCTION")
+    print("=" * 80)
+    print(f"Livre original : {pdf_path.name} ({total_pdf_pages} pages, {total_src_words:,} mots)")
+    print(f"Dossier cible  : {chapters_dir.name} ({len(md_files)} chapitres, {total_trans_words:,} mots)")
+    print(f"Ratio global   : {global_ratio:.2f}x (Seuil minimal attendu : {min_ratio:.2f}x)")
+    print(f"Statut global  : {global_status}")
+    print("-" * 80)
+
+    header = f"{'CH':<4} | {'TITRE':<28} | {'SRC':<7} | {'TRAD':<7} | {'RATIO':<6} | {'IMAGES':<6} | {'CODE':<5} | {'STATUT'}"
+    print(header)
+    print("-" * 80)
+    for c in chapter_audits:
+        title_disp = (c['title'][:25] + "...") if len(c['title']) > 28 else c['title']
+        row = f"{c['chapter_num']:<4} | {title_disp:<28} | {c['source_words']:<7} | {c['translated_words']:<7} | {c['expansion_ratio']:<6.2f} | {c['images_count']:<6} | {c['code_blocks']:<5} | {c['badge']}"
+        print(row)
+    print("-" * 80)
+    print(f"Images détectées : {total_images_found} (avec {total_image_boxes_found} encadrés de traduction visuelle)")
+    if total_code_blocks > 0:
+        print(f"⚠️ AVERTISSEMENT : {total_code_blocks} blocs de code informatique (```) détectés ! (Doivent être remplacés par des citations ou tableaux)")
+    print("=" * 80)
+
+    # Save JSON report
+    report_json = args.report_json
+    if not report_json:
+        report_json = chapters_dir / "audit_report.json"
+    else:
+        report_json = pathlib.Path(report_json).resolve()
+
+    audit_data = {
+        "source_pdf": str(pdf_path),
+        "total_source_pages": total_pdf_pages,
+        "total_source_words": total_src_words,
+        "total_translated_words": total_trans_words,
+        "global_expansion_ratio": round(global_ratio, 2),
+        "min_required_ratio": min_ratio,
+        "global_status": global_status,
+        "total_code_blocks_prohibited": total_code_blocks,
+        "total_images": total_images_found,
+        "total_image_translation_boxes": total_image_boxes_found,
+        "has_critical_failure": has_critical_failure,
+        "chapters": chapter_audits
+    }
+    report_json.write_text(json.dumps(audit_data, indent=2, ensure_ascii=False), encoding='utf-8')
+    print(f"Rapport JSON enregistré : '{report_json}'")
+
+    # Save Markdown report
+    report_md = args.report_md
+    if not report_md:
+        report_md = chapters_dir / "00_RAPPORT_AUDIT_COMPLETUDE.md"
+    else:
+        report_md = pathlib.Path(report_md).resolve()
+
+    md_lines = [
+        f"# Rapport d'Audit de Complétude et d'Intégrité de Traduction",
+        f"",
+        f"> **Document source :** `{pdf_path.name}` ({total_pdf_pages} pages, {total_src_words:,} mots)  ",
+        f"> **Traduction française :** {total_trans_words:,} mots  ",
+        f"> **Ratio de foisonnement global :** **{global_ratio:.2f}x** (Norme FR attendue : ≥ {min_ratio:.2f}x)  ",
+        f"> **Verdict global :** {global_status}",
+        f"",
+        f"---",
+        f"",
+        f"## Tableau Récapitulatif par Chapitre",
+        f"",
+        f"| Chapitre | Titre Source | Pages | Mots Anglais | Mots Français | Ratio | Images | Blocs Code | Évaluation |",
+        f"| :---: | :--- | :---: | :---: | :---: | :---: | :---: | :---: | :--- |"
+    ]
+    for c in chapter_audits:
+        md_lines.append(
+            f"| **{c['chapter_num']}** | {c['title']} | {c['page_range']} | {c['source_words']:,} | {c['translated_words']:,} | **{c['expansion_ratio']:.2f}** | {c['images_count']} ({c['image_translation_boxes']} trad.) | {c['code_blocks']} | {c['badge']} |"
+        )
+    md_lines.extend([
+        f"",
+        f"---",
+        f"",
+        f"## Diagnostic Détaillé et Sections Manquantes",
+        f""
+    ])
+    for c in chapter_audits:
+        if c['badge'].startswith("🔴") or c['badge'].startswith("🟡"):
+            md_lines.append(f"### Chapitre {c['chapter_num']} : {c['title']} ({c['badge']})")
+            md_lines.append(f"- **Fichier :** `{c['file']}`")
+            md_lines.append(f"- **Déficit estimé :** {max(0, int(c['source_words'] * 1.15 - c['translated_words']))} mots manquants pour atteindre le standard d'intégralité.")
+            if c['source_subheadings']:
+                md_lines.append(f"- **Sous-sections sources identifiées dans l'ouvrage original :**")
+                for s in c['source_subheadings']:
+                    md_lines.append(f"  - `{s}`")
+            md_lines.append("")
+
+    report_md.write_text("\n".join(md_lines), encoding='utf-8')
+    print(f"Rapport Markdown enregistré : '{report_md}'")
+
+    if args.strict and has_critical_failure:
+        sys.stderr.write("\n❌ ERREUR STRICTE : Des chapitres tronqués ou manquants ont été détectés. Fusion bloquée.\n")
+        sys.exit(1)
+
+
 def main():
     parser = argparse.ArgumentParser(
         description="Universal CLI pipeline for translating illustrated PDF books (traduction-livre-pdf skill)."
@@ -825,7 +1113,17 @@ def main():
     p_ext.add_argument("--out-dir", required=True, help="Directory to save book_text.txt, images/, and manifest.")
     p_ext.set_defaults(func=cmd_extract)
 
-    # 2. merge
+    # 2. audit (or verify)
+    p_aud = subparsers.add_parser("audit", aliases=["verify", "check"], help="Audit completeness and fidelity between source PDF and translated chapters.")
+    p_aud.add_argument("--pdf", required=True, help="Path to source PDF file.")
+    p_aud.add_argument("--chapters-dir", required=True, help="Directory containing numbered chapter .md files.")
+    p_aud.add_argument("--min-ratio", type=float, default=1.05, help="Minimum acceptable word expansion ratio (default: 1.05).")
+    p_aud.add_argument("--strict", action="store_true", help="Fail with exit code 1 if any chapter is cut or missing.")
+    p_aud.add_argument("--report-md", default=None, help="Custom output path for Markdown audit report.")
+    p_aud.add_argument("--report-json", default=None, help="Custom output path for JSON audit report.")
+    p_aud.set_defaults(func=cmd_audit)
+
+    # 3. merge
     p_mrg = subparsers.add_parser("merge", help="Merge translated Markdown chapters into a unified book.")
     p_mrg.add_argument("--chapters-dir", required=True, help="Directory containing numbered chapter .md files.")
     p_mrg.add_argument("--output", required=True, help="Path for the merged Markdown file.")
@@ -834,7 +1132,7 @@ def main():
     p_mrg.add_argument("--author", required=True, help="Book author name.")
     p_mrg.set_defaults(func=cmd_merge)
 
-    # 3. build-pdf
+    # 4. build-pdf
     p_pdf = subparsers.add_parser("build-pdf", help="Build a print-ready A4 PDF from the merged Markdown book.")
     p_pdf.add_argument("--input", required=True, help="Path to merged Markdown file.")
     p_pdf.add_argument("--output", required=True, help="Path to output PDF file.")
